@@ -1,0 +1,219 @@
+# ETL3 Configuration File
+# S3 Partitioned Data Warehouse Pipeline
+
+# S3 Configuration
+s3:
+  bucket: "healthcare-data-lake-prod"
+  region: "us-east-1"
+  prefix: "partitioned-data"
+  compression: "zstd"
+  encryption: "AES256"
+
+# Processing Configuration
+processing:
+  chunk_size: 50000
+  max_workers: 4
+  memory_limit_mb: 8192
+  enable_streaming: true
+
+# Data Paths
+data_paths:
+  input_dir: "data"
+  output_dir: "data/partitioned"
+  fact_rate_path: "data/gold/fact_rate.parquet"
+  
+  dimensions:
+    code: "data/dims/dim_code.parquet"
+    code_cat: "data/dims/dim_code_cat.parquet"
+    payer: "data/dims/dim_payer.parquet"
+    provider_group: "data/dims/dim_provider_group.parquet"
+    pos_set: "data/dims/dim_pos_set.parquet"
+    npi: "data/dims/dim_npi.parquet"
+    npi_address: "data/dims/dim_npi_address.parquet"
+    npi_address_geo: "data/dims/dim_npi_address_geolocation.parquet"
+    medicare_benchmark: "data/dims/bench_medicare_comprehensive.parquet"
+  
+  cross_references:
+    pg_member_npi: "data/xrefs/xref_pg_member_npi.parquet"
+    pg_member_tin: "data/xrefs/xref_pg_member_tin.parquet"
+
+# Partitioning Configuration
+partitioning:
+  partition_columns:
+    - "payer_slug"
+    - "state"
+    - "billing_class"
+    - "procedure_set"
+    - "procedure_class"
+    - "primary_taxonomy_code"
+    - "stat_area_name"
+    - "year"
+    - "month"
+  
+  # Partition size limits
+  max_partition_size_mb: 100
+  min_partition_rows: 1
+  max_partition_rows: 10000
+
+# Athena Configuration
+athena:
+  database: "healthcare_data_lake"
+  table: "fact_rate_enriched"
+  output_location: "s3://healthcare-data-lake-prod/athena-results/"
+  
+  # Partition projection settings
+  projection:
+    payer_slug:
+      type: "enum"
+      values: ["unitedhealthcare-of-georgia-inc", "anthem-blue-cross-blue-shield"]
+    state:
+      type: "enum"
+      values: ["GA", "FL", "CA", "TX", "NY", "IL", "PA", "OH", "NC", "MI"]
+    billing_class:
+      type: "enum"
+      values: ["professional", "institutional"]
+    year:
+      type: "integer"
+      range: "2020,2030"
+    month:
+      type: "integer"
+      range: "1,12"
+
+# Glue Configuration
+glue:
+  crawler_name: "fact_rate_enriched_crawler"
+  database_name: "healthcare_data_lake"
+  role_arn: "arn:aws:iam::123456789012:role/GlueServiceRole"
+  
+  # Crawler settings
+  recrawl_behavior: "CRAWL_EVERYTHING"
+  schema_change_policy:
+    update_behavior: "UPDATE_IN_DATABASE"
+    delete_behavior: "LOG"
+
+# Data Quality Configuration
+data_quality:
+  enable_validation: true
+  sample_partitions: 10
+  max_errors_per_partition: 100
+  
+  # Quality rules
+  rules:
+    required_fields:
+      - "fact_uid"
+      - "negotiated_rate"
+      - "state"
+      - "payer_slug"
+    
+    rate_validation:
+      min_value: 0.01
+      max_value: 1000000.0
+    
+    state_validation:
+      valid_values: ["GA", "FL", "CA", "TX", "NY", "IL", "PA", "OH", "NC", "MI"]
+    
+    npi_validation:
+      pattern: "^\\d{10}$"
+    
+    geocoding_validation:
+      latitude_range: [-90, 90]
+      longitude_range: [-180, 180]
+
+# Monitoring Configuration
+monitoring:
+  enable_cloudwatch: true
+  enable_dashboard: true
+  enable_alarms: true
+  
+  # CloudWatch settings
+  namespace: "HealthcareDataLake/ETL3"
+  
+  # Alarms
+  alarms:
+    high_error_rate:
+      threshold: 10
+      evaluation_periods: 1
+    
+    low_processing_rate:
+      threshold: 100
+      evaluation_periods: 2
+    
+    high_memory_usage:
+      threshold: 80
+      evaluation_periods: 1
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # Log files
+  log_dir: "logs"
+  max_file_size_mb: 100
+  backup_count: 5
+
+# Security Configuration
+security:
+  enable_s3_encryption: true
+  enable_versioning: true
+  block_public_access: true
+  
+  # IAM permissions required
+  required_permissions:
+    - "s3:GetObject"
+    - "s3:PutObject"
+    - "s3:DeleteObject"
+    - "s3:ListBucket"
+    - "athena:StartQueryExecution"
+    - "athena:GetQueryExecution"
+    - "glue:CreateCrawler"
+    - "glue:StartCrawler"
+    - "cloudwatch:PutMetricData"
+    - "cloudwatch:PutDashboard"
+
+# Performance Tuning
+performance:
+  # S3 settings
+  s3:
+    max_pool_connections: 50
+    retry_attempts: 3
+    timeout_seconds: 30
+  
+  # Polars settings
+  polars:
+    streaming: true
+    lazy_evaluation: true
+    memory_efficient: true
+  
+  # Parallel processing
+  parallel:
+    max_workers: 4
+    chunk_size: 50000
+    enable_multiprocessing: true
+
+# Environment-specific overrides
+environments:
+  development:
+    s3:
+      bucket: "healthcare-data-lake-dev"
+    processing:
+      chunk_size: 10000
+    monitoring:
+      enable_alarms: false
+  
+  staging:
+    s3:
+      bucket: "healthcare-data-lake-staging"
+    processing:
+      chunk_size: 25000
+    monitoring:
+      enable_alarms: true
+  
+  production:
+    s3:
+      bucket: "healthcare-data-lake-prod"
+    processing:
+      chunk_size: 50000
+    monitoring:
+      enable_alarms: true
+      enable_dashboard: true
