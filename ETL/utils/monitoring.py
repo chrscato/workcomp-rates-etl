@@ -242,7 +242,7 @@ class ETLMonitor:
                     MetricData=batch
                 )
             
-            logger.info("✅ Metrics sent to CloudWatch successfully")
+            logger.info("Metrics sent to CloudWatch successfully")
             
         except ClientError as e:
             logger.error(f"Failed to send metrics to CloudWatch: {e}")
@@ -361,7 +361,7 @@ class ETLMonitor:
                 DashboardBody=json.dumps(dashboard_body)
             )
             
-            logger.info(f"✅ Dashboard created: {dashboard_name}")
+            logger.info(f"Dashboard created: {dashboard_name}")
             return dashboard_name
             
         except ClientError as e:
@@ -425,7 +425,7 @@ class ETLMonitor:
         except ClientError as e:
             logger.error(f"Failed to create rate alarm: {e}")
         
-        logger.info(f"✅ Created {len(alarms)} CloudWatch alarms")
+        logger.info(f"Created {len(alarms)} CloudWatch alarms")
         return alarms
     
     def generate_report(self, pipeline_id: str, output_path: Path) -> Dict[str, Any]:

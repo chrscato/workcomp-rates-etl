@@ -18,6 +18,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 import logging
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,14 @@ class S3PartitionedETL:
         # Time dimensions
         year = partition_values.get('year', datetime.now().year)
         month = partition_values.get('month', datetime.now().month)
-        path_parts.extend([f"year={year}", f"month={month:02d}"])
+        
+        # Ensure month is properly formatted as string with zero padding
+        if isinstance(month, str):
+            month_str = month.zfill(2)
+        else:
+            month_str = f"{month:02d}"
+            
+        path_parts.extend([f"year={year}", f"month={month_str}"])
         
         return f"s3://{self.bucket_name}/" + "/".join(path_parts) + "/fact_rate_enriched.parquet"
     
@@ -107,11 +115,11 @@ class S3PartitionedETL:
                 ServerSideEncryption='AES256'
             )
             
-            logger.info(f"✅ Successfully uploaded {partition_data.height:,} rows to {s3_path}")
+            logger.info(f"[SUCCESS] Successfully uploaded {partition_data.height:,} rows to {s3_path}")
             return s3_path
             
         except ClientError as e:
-            logger.error(f"❌ Failed to upload to S3: {e}")
+            logger.error(f"[ERROR] Failed to upload to S3: {e}")
             raise
         finally:
             parquet_buffer.close()
@@ -151,7 +159,7 @@ class S3PartitionedETL:
             self.upload_partition_to_s3(partition_data, s3_path)
             created_partitions.append(s3_path)
         
-        logger.info(f"✅ Created {len(created_partitions)} partitions")
+        logger.info(f"[SUCCESS] Created {len(created_partitions)} partitions")
         return created_partitions
     
     def _create_partition_filter(self, partition_row: Dict[str, Any]) -> pl.Expr:
@@ -332,7 +340,7 @@ class S3PartitionedETL:
             )
             
             query_execution_id = response['QueryExecutionId']
-            logger.info(f"✅ Athena table creation started: {query_execution_id}")
+            logger.info(f"[SUCCESS] Athena table creation started: {query_execution_id}")
             
             # Wait for completion
             self._wait_for_athena_query(query_execution_id)
@@ -371,7 +379,7 @@ class S3PartitionedETL:
             }
             
             response = self.glue_client.create_crawler(**crawler_config)
-            logger.info(f"✅ Glue crawler created: {crawler_name}")
+            logger.info(f"[SUCCESS] Glue crawler created: {crawler_name}")
             
             return crawler_name
             
@@ -389,7 +397,7 @@ class S3PartitionedETL:
             status = response['QueryExecution']['Status']['State']
             
             if status in ['SUCCEEDED']:
-                logger.info(f"✅ Athena query completed: {query_execution_id}")
+                logger.info(f"[SUCCESS] Athena query completed: {query_execution_id}")
                 return
             elif status in ['FAILED', 'CANCELLED']:
                 error_reason = response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
@@ -445,7 +453,7 @@ class S3PartitionedETL:
                 }
             )
             
-            logger.info("✅ S3 security configuration completed")
+            logger.info("[SUCCESS] S3 security configuration completed")
             
         except ClientError as e:
             logger.error(f"Failed to configure S3 security: {e}")
@@ -479,7 +487,7 @@ class S3PartitionedETL:
                 }
             )
             
-            logger.info("✅ S3 Intelligent Tiering configured")
+            logger.info("[SUCCESS] S3 Intelligent Tiering configured")
             
         except ClientError as e:
             logger.error(f"Failed to configure Intelligent Tiering: {e}")

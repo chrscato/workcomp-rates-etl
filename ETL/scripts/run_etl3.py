@@ -162,7 +162,7 @@ def validate_prerequisites():
         logger.error(f"AWS credentials not available: {e}")
         return False
     
-    logger.info("✅ All prerequisites validated")
+    logger.info("All prerequisites validated")
     return True
 
 
@@ -251,7 +251,7 @@ def main():
     
     try:
         # Run the ETL3 pipeline
-        logger.info("🚀 Starting ETL3 Pipeline")
+        logger.info("Starting ETL3 Pipeline")
         
         summary = run_etl3_pipeline()
         
@@ -284,10 +284,10 @@ def main():
         print(f"Athena Table: {summary['athena_table']}")
         print("="*60)
         
-        logger.info("🎉 ETL3 Pipeline completed successfully!")
+        logger.info("ETL3 Pipeline completed successfully!")
         
     except Exception as e:
-        logger.error(f"❌ ETL3 Pipeline failed: {str(e)}")
+        logger.error(f"ETL3 Pipeline failed: {str(e)}")
         
         # Update monitoring
         if monitor:
