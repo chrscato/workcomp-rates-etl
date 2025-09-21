@@ -68,6 +68,7 @@ class ETL3Config:
         # Dimension file paths
         self.DIM_PATHS = {
             'code': self.DIM_DIR / "dim_code.parquet",
+            'code_cat': self.DIM_DIR / "dim_code_cat.parquet",
             'payer': self.DIM_DIR / "dim_payer.parquet",
             'provider_group': self.DIM_DIR / "dim_provider_group.parquet",
             'pos_set': self.DIM_DIR / "dim_pos_set.parquet",
@@ -322,6 +323,16 @@ def _enrich_fact_table(fact_rate: pl.DataFrame, dimensions: Dict[str, pl.DataFra
         )
         logger.info("Joined with code dimension")
     
+    # Join with code categorization dimension
+    if 'code_cat' in dimensions:
+        enriched = enriched.join(
+            dimensions['code_cat'],
+            left_on='code',
+            right_on='proc_cd',
+            how='left'
+        )
+        logger.info("Joined with code categorization dimension")
+    
     # Join with payer dimension
     if 'payer' in dimensions:
         enriched = enriched.join(
@@ -363,25 +374,33 @@ def _enrich_fact_table(fact_rate: pl.DataFrame, dimensions: Dict[str, pl.DataFra
         )
         logger.info("Joined with NPI data through cross-reference")
     
-    # Add address data through NPI
-    if 'npi_address' in dimensions and 'npi' in enriched.columns:
+    # Add TIN data through cross-reference
+    if 'pg_member_tin' in xrefs:
         enriched = enriched.join(
-            dimensions['npi_address'],
-            on='npi',
-            how='left',
-            suffix='_addr'
+            xrefs['pg_member_tin'],
+            on='pg_uid',
+            how='left'
         )
-        logger.info("Joined with NPI address data")
+        logger.info("Joined with TIN data through cross-reference")
     
-    # Add geolocation data through NPI address
+    # Add geolocation data through NPI address (LOCATION addresses only)
     if 'npi_address_geo' in dimensions and 'npi' in enriched.columns:
+        # Filter for LOCATION addresses only (not MAILING) and select only geo fields
+        location_addresses = dimensions['npi_address_geo'].filter(
+            pl.col('address_purpose') == 'LOCATION'
+        ).select([
+            'npi',  # Keep NPI for joining
+            'state',  # Include state for partitioning
+            'latitude', 'longitude', 'county_name', 'county_fips', 
+            'stat_area_name', 'stat_area_code', 'matched_address'
+        ])
         enriched = enriched.join(
-            dimensions['npi_address_geo'],
+            location_addresses,
             on='npi',
             how='left',
             suffix='_geo'
         )
-        logger.info("Joined with NPI geolocation data")
+        logger.info("Joined with NPI geolocation data (LOCATION addresses only, geo fields only)")
     
     # Add partitioning columns using the new extract_partition_keys function
     enriched = extract_partition_keys(enriched)
@@ -669,12 +688,12 @@ def extract_partition_keys(enriched_df: pl.DataFrame) -> pl.DataFrame:
         
     Partition mapping:
     - payer_slug: from fact table
-    - state: from dim_npi_address (state_addr)
+    - state: from dim_npi_address_geo (state, LOCATION addresses only)
     - billing_class: from fact table
-    - procedure_set: derived from code_description categorization
-    - procedure_class: from dim_code (code_type)
+    - procedure_set: from dim_code_cat (proc_set)
+    - procedure_class: from dim_code_cat (proc_class)
     - primary_taxonomy_code: from dim_npi
-    - stat_area_name: from dim_npi_address_geo (stat_area_name)
+    - stat_area_name: from dim_npi_address_geo (stat_area_name, LOCATION addresses only)
     - year: extracted from year_month
     - month: extracted from year_month
     """
@@ -685,12 +704,12 @@ def extract_partition_keys(enriched_df: pl.DataFrame) -> pl.DataFrame:
         # Define the partition column mapping
         partition_mapping = {
             'payer_slug': 'payer_slug',  # from fact
-            'state': 'state_addr',  # from dim_npi_address
+            'state': 'state_geo',  # from dim_npi_address_geo (LOCATION addresses only) - gets _geo suffix due to conflict
             'billing_class': 'billing_class',  # from fact
-            'procedure_set': 'code_description',  # will be categorized
-            'procedure_class': 'code_type',  # from dim_code
+            'procedure_set': 'proc_set',  # from dim_code_cat
+            'procedure_class': 'proc_class',  # from dim_code_cat
             'primary_taxonomy_code': 'primary_taxonomy_code',  # from dim_npi
-            'stat_area_name': 'stat_area_name',  # from dim_npi_address_geo
+            'stat_area_name': 'stat_area_name',  # from dim_npi_address_geo (LOCATION addresses only) - no suffix needed
             'year': 'year_month',  # will be extracted
             'month': 'year_month'  # will be extracted
         }
@@ -741,23 +760,24 @@ def extract_partition_keys(enriched_df: pl.DataFrame) -> pl.DataFrame:
             result_df = result_df.with_columns(pl.lit('__NULL__').alias('payer_slug'))
             logger.warning("payer_slug not found, using __NULL__")
         
-        # Handle state (from dim_npi_address)
-        if 'state_addr' in enriched_df.columns:
+        # Handle state (from dim_npi_address_geo, LOCATION addresses only)
+        if 'state_geo' in enriched_df.columns:
             result_df = result_df.with_columns(
-                pl.when(pl.col('state_addr').is_null())
+                pl.when(pl.col('state_geo').is_null())
                 .then(pl.lit('__NULL__'))
-                .otherwise(pl.col('state_addr'))
+                .otherwise(pl.col('state_geo'))
                 .alias('state')
             )
-            logger.info("Added state partition key from state_addr")
+            logger.info("Added state partition key from dim_npi_address_geo.state (LOCATION addresses)")
         elif 'state' in enriched_df.columns:
+            # Fallback to fact table state if geo state not available
             result_df = result_df.with_columns(
                 pl.when(pl.col('state').is_null())
                 .then(pl.lit('__NULL__'))
                 .otherwise(pl.col('state'))
                 .alias('state')
             )
-            logger.info("Added state partition key from state")
+            logger.info("Added state partition key from fact table state (fallback)")
         else:
             result_df = result_df.with_columns(pl.lit('__NULL__').alias('state'))
             logger.warning("No state column found, using __NULL__")
@@ -775,45 +795,31 @@ def extract_partition_keys(enriched_df: pl.DataFrame) -> pl.DataFrame:
             result_df = result_df.with_columns(pl.lit('__NULL__').alias('billing_class'))
             logger.warning("billing_class not found, using __NULL__")
         
-        # Handle procedure_set (categorize from code_description)
-        if 'code_description' in enriched_df.columns:
+        # Handle procedure_set (from dim_code_cat)
+        if 'proc_set' in enriched_df.columns:
             result_df = result_df.with_columns(
-                pl.when(pl.col('code_description').is_null())
+                pl.when(pl.col('proc_set').is_null())
                 .then(pl.lit('__NULL__'))
-                .when(pl.col('code_description').str.to_lowercase().str.contains('evaluation|management|office visit|consultation'))
-                .then(pl.lit('Evaluation and Management'))
-                .when(pl.col('code_description').str.to_lowercase().str.contains('surgery|surgical|operation|procedure'))
-                .then(pl.lit('Surgery'))
-                .when(pl.col('code_description').str.to_lowercase().str.contains('imaging|radiology|mri|ct|ultrasound|x-ray'))
-                .then(pl.lit('Radiology'))
-                .when(pl.col('code_description').str.to_lowercase().str.contains('laboratory|lab|blood|urine|test'))
-                .then(pl.lit('Laboratory'))
-                .when(pl.col('code_description').str.to_lowercase().str.contains('therapy|rehabilitation|physical|occupational'))
-                .then(pl.lit('Therapy'))
-                .when(pl.col('code_description').str.to_lowercase().str.contains('emergency|urgent|trauma'))
-                .then(pl.lit('Emergency'))
-                .when(pl.col('code_description').str.to_lowercase().str.contains('anesthesia|anesthetic'))
-                .then(pl.lit('Anesthesia'))
-                .otherwise(pl.lit('Other'))
+                .otherwise(pl.col('proc_set'))
                 .alias('procedure_set')
             )
-            logger.info("Added procedure_set partition key from code_description categorization")
+            logger.info("Added procedure_set partition key from dim_code_cat.proc_set")
         else:
             result_df = result_df.with_columns(pl.lit('__NULL__').alias('procedure_set'))
-            logger.warning("code_description not found, using __NULL__")
+            logger.warning("proc_set not found in dim_code_cat, using __NULL__")
         
-        # Handle procedure_class (from dim_code)
-        if 'code_type' in enriched_df.columns:
+        # Handle procedure_class (from dim_code_cat)
+        if 'proc_class' in enriched_df.columns:
             result_df = result_df.with_columns(
-                pl.when(pl.col('code_type').is_null())
+                pl.when(pl.col('proc_class').is_null())
                 .then(pl.lit('__NULL__'))
-                .otherwise(pl.col('code_type'))
+                .otherwise(pl.col('proc_class'))
                 .alias('procedure_class')
             )
-            logger.info("Added procedure_class partition key from code_type")
+            logger.info("Added procedure_class partition key from dim_code_cat.proc_class")
         else:
             result_df = result_df.with_columns(pl.lit('__NULL__').alias('procedure_class'))
-            logger.warning("code_type not found, using __NULL__")
+            logger.warning("proc_class not found in dim_code_cat, using __NULL__")
         
         # Handle primary_taxonomy_code (from dim_npi)
         if 'primary_taxonomy_code' in enriched_df.columns:
@@ -828,7 +834,7 @@ def extract_partition_keys(enriched_df: pl.DataFrame) -> pl.DataFrame:
             result_df = result_df.with_columns(pl.lit('__NULL__').alias('primary_taxonomy_code'))
             logger.warning("primary_taxonomy_code not found, using __NULL__")
         
-        # Handle stat_area_name (from dim_npi_address_geo)
+        # Handle stat_area_name (from dim_npi_address_geo, LOCATION addresses only)
         if 'stat_area_name' in enriched_df.columns:
             result_df = result_df.with_columns(
                 pl.when(pl.col('stat_area_name').is_null())
@@ -836,7 +842,7 @@ def extract_partition_keys(enriched_df: pl.DataFrame) -> pl.DataFrame:
                 .otherwise(pl.col('stat_area_name'))
                 .alias('stat_area_name')
             )
-            logger.info("Added stat_area_name partition key from dim_npi_address_geo")
+            logger.info("Added stat_area_name partition key from dim_npi_address_geo (LOCATION addresses)")
         else:
             result_df = result_df.with_columns(pl.lit('__NULL__').alias('stat_area_name'))
             logger.warning("stat_area_name not found, using __NULL__")

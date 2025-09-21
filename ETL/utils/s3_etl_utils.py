@@ -63,7 +63,7 @@ class S3PartitionedETL:
         path_parts = [prefix]
         
         # Business dimensions
-        for dim in ['payer_slug', 'state', 'billing_class', 'procedure_set', 'procedure_class', 'taxonomy', 'stat_area_name']:
+        for dim in ['payer_slug', 'state', 'billing_class', 'procedure_set', 'procedure_class', 'primary_taxonomy_code', 'stat_area_name']:
             value = partition_values.get(dim)
             if value is None:
                 value = "null"
@@ -330,7 +330,7 @@ class S3PartitionedETL:
             billing_class string,
             procedure_set string,
             procedure_class string,
-            taxonomy string,
+            primary_taxonomy_code string,
             stat_area_name string,
             year int,
             month int
@@ -349,7 +349,7 @@ class S3PartitionedETL:
             'projection.year.range' = '2020,2030',
             'projection.month.type' = 'integer',
             'projection.month.range' = '1,12',
-            'storage.location.template' = 's3://{self.bucket_name}/partitioned-data/payer_slug=${{payer_slug}}/state=${{state}}/billing_class=${{billing_class}}/procedure_set=${{procedure_set}}/procedure_class=${{procedure_class}}/taxonomy=${{taxonomy}}/stat_area_name=${{stat_area_name}}/year=${{year}}/month=${{month}}/'
+            'storage.location.template' = 's3://{self.bucket_name}/partitioned-data/payer_slug=${{payer_slug}}/state=${{state}}/billing_class=${{billing_class}}/procedure_set=${{procedure_set}}/procedure_class=${{procedure_class}}/primary_taxonomy_code=${{primary_taxonomy_code}}/stat_area_name=${{stat_area_name}}/year=${{year}}/month=${{month}}/'
         )
         """
         
