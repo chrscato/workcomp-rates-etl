@@ -221,7 +221,8 @@ def run_etl3_pipeline(config: Optional[ETL3Config] = None) -> Dict[str, Any]:
                     enriched_chunk, 
                     config.PARTITION_COLUMNS,
                     s3_etl,
-                    config.S3_PREFIX
+                    config.S3_PREFIX,
+                    config
                 )
                 
                 total_partitions += len(chunk_partitions)
@@ -382,29 +383,39 @@ def _enrich_fact_table(fact_rate: pl.DataFrame, dimensions: Dict[str, pl.DataFra
         )
         logger.info("Joined with NPI geolocation data")
     
-    # Add partitioning columns
-    enriched = _add_partitioning_columns(enriched)
+    # Add partitioning columns using the new extract_partition_keys function
+    enriched = extract_partition_keys(enriched)
     
     logger.info(f"Enriched fact table: {enriched.height:,} rows, {len(enriched.columns)} columns")
     return enriched
 
 
 def _create_partitions_for_chunk(chunk_data: pl.DataFrame, partition_columns: List[str], 
-                                s3_etl: S3PartitionedETL, prefix: str) -> List[str]:
+                                s3_etl: S3PartitionedETL, prefix: str, config: Optional[ETL3Config] = None) -> List[str]:
     """
-    Create S3 partitions for a single chunk of data.
+    Create S3 partitions for a single chunk of data with idempotent writes.
     
     Args:
         chunk_data: Chunk of enriched data
         partition_columns: List of columns to partition by
         s3_etl: S3PartitionedETL instance
         prefix: S3 prefix for partitions
+        config: ETL3Config instance for validation (optional)
         
     Returns:
-        List of created S3 partition paths
+        List of created/updated S3 partition paths
     """
     
     created_partitions = []
+    
+    # Validate partition data quality if config is provided
+    if config is not None:
+        try:
+            validate_partition_data(chunk_data, config)
+        except ValueError as e:
+            logger.error(f"Partition validation failed for chunk: {e}")
+            # Continue processing but log the validation failure
+            logger.warning("Continuing with partition creation despite validation failures")
     
     # Get unique partition combinations for this chunk
     partition_combinations = (
@@ -413,6 +424,8 @@ def _create_partitions_for_chunk(chunk_data: pl.DataFrame, partition_columns: Li
         .unique()
         .sort(partition_columns)
     )
+    
+    logger.info(f"Processing {partition_combinations.height} unique partition combinations")
     
     # Process each partition combination
     for partition_row in partition_combinations.iter_rows(named=True):
@@ -425,12 +438,20 @@ def _create_partitions_for_chunk(chunk_data: pl.DataFrame, partition_columns: Li
         
         # Skip if no data
         if partition_data.height == 0:
+            logger.debug(f"No data for partition: {s3_path}")
             continue
         
-        # Upload to S3
-        s3_etl.upload_partition_to_s3(partition_data, s3_path)
-        created_partitions.append(s3_path)
+        # Write partition idempotently (handles duplicates and existing partitions)
+        try:
+            write_partition_idempotent(partition_data, s3_path, s3_etl)
+            created_partitions.append(s3_path)
+            logger.debug(f"Successfully processed partition: {s3_path} ({partition_data.height:,} rows)")
+        except Exception as e:
+            logger.error(f"Failed to process partition {s3_path}: {e}")
+            # Continue with next partition instead of failing completely
+            continue
     
+    logger.info(f"Successfully processed {len(created_partitions)} partitions")
     return created_partitions
 
 
@@ -446,33 +467,455 @@ def _create_partition_filter(partition_row: Dict[str, Any]) -> pl.Expr:
     return pl.all_horizontal(conditions)
 
 
+def merge_partition_data(existing_data: pl.DataFrame, new_data: pl.DataFrame) -> pl.DataFrame:
+    """
+    Merge partition data handling duplicates.
+    
+    Args:
+        existing_data: Existing partition data
+        new_data: New data to merge
+        
+    Returns:
+        Merged DataFrame with duplicates removed
+    """
+    
+    logger.info(f"Merging partition data: {existing_data.height:,} existing + {new_data.height:,} new rows")
+    
+    try:
+        # Ensure both dataframes have the same schema
+        if existing_data.columns != new_data.columns:
+            logger.warning("Schema mismatch between existing and new data, aligning columns")
+            # Get common columns
+            common_columns = list(set(existing_data.columns) & set(new_data.columns))
+            existing_data = existing_data.select(common_columns)
+            new_data = new_data.select(common_columns)
+        
+        # Add unique row identifiers if not present
+        if 'row_id' not in existing_data.columns:
+            existing_data = existing_data.with_row_index('row_id', offset=0)
+        
+        if 'row_id' not in new_data.columns:
+            # Offset by existing data size to avoid conflicts
+            new_data = new_data.with_row_index('row_id', offset=existing_data.height)
+        
+        # Combine the data
+        combined_data = pl.concat([existing_data, new_data])
+        
+        # Define deduplication key - use fact_uid as primary key if available, otherwise use all columns
+        if 'fact_uid' in combined_data.columns:
+            dedup_key = ['fact_uid']
+            logger.info("Using fact_uid as deduplication key")
+        else:
+            # Use all columns except row_id for deduplication
+            dedup_key = [col for col in combined_data.columns if col != 'row_id']
+            logger.info(f"Using all columns except row_id as deduplication key: {dedup_key}")
+        
+        # Remove duplicates, keeping the last occurrence (newest data wins)
+        merged_data = combined_data.unique(subset=dedup_key, keep='last')
+        
+        # Remove the temporary row_id column
+        if 'row_id' in merged_data.columns:
+            merged_data = merged_data.drop('row_id')
+        
+        logger.info(f"Merged partition data: {merged_data.height:,} rows (removed {combined_data.height - merged_data.height:,} duplicates)")
+        return merged_data
+        
+    except Exception as e:
+        logger.error(f"Error merging partition data: {e}")
+        # Fallback: return new data if merge fails
+        logger.warning("Merge failed, returning new data only")
+        return new_data
+
+
+def write_partition_idempotent(partition_data: pl.DataFrame, s3_path: str, s3_etl: S3PartitionedETL) -> str:
+    """
+    Write partition data idempotently.
+    If partition exists, merge with existing data.
+    
+    Args:
+        partition_data: Data to write
+        s3_path: S3 path for the partition
+        s3_etl: S3PartitionedETL instance
+        
+    Returns:
+        S3 path of the written partition
+    """
+    
+    logger.info(f"Writing partition idempotently: {s3_path}")
+    
+    try:
+        # Check if partition already exists in S3
+        if s3_etl.partition_exists(s3_path):
+            logger.info(f"Partition exists, merging with existing data: {s3_path}")
+            
+            # Download existing partition
+            existing_data = s3_etl.read_partition(s3_path)
+            
+            # Merge with new data (handle duplicates by unique key)
+            merged_data = merge_partition_data(existing_data, partition_data)
+            
+            # Write back merged data
+            s3_etl.upload_partition_to_s3(merged_data, s3_path)
+            
+            logger.info(f"Successfully merged and wrote partition: {s3_path}")
+        else:
+            # New partition, write directly
+            logger.info(f"New partition, writing directly: {s3_path}")
+            s3_etl.upload_partition_to_s3(partition_data, s3_path)
+            
+            logger.info(f"Successfully wrote new partition: {s3_path}")
+        
+        return s3_path
+        
+    except Exception as e:
+        logger.error(f"Error writing partition idempotently {s3_path}: {e}")
+        raise
+
+
+def validate_partition_data(df: pl.DataFrame, config: ETL3Config) -> bool:
+    """
+    Validate that partition columns have real data, not defaults.
+    
+    Args:
+        df: DataFrame with partition columns
+        config: ETL3Config instance with PARTITION_COLUMNS
+        
+    Returns:
+        True if validation passes
+        
+    Raises:
+        ValueError: If partition validation fails
+    """
+    
+    logger.info("Validating partition data quality...")
+    
+    issues = []
+    
+    for partition_col in config.PARTITION_COLUMNS:
+        if partition_col not in df.columns:
+            issues.append(f"Partition column {partition_col} not found in data")
+            continue
+            
+        # Check for excessive defaults (Unknown values)
+        unknown_count = df.filter(pl.col(partition_col) == 'Unknown').height
+        unknown_ratio = unknown_count / df.height if df.height > 0 else 0
+        
+        if unknown_ratio > 0.1:  # More than 10% defaults
+            issues.append(f"Column {partition_col} has {unknown_ratio:.1%} default values ({unknown_count:,}/{df.height:,} rows)")
+        
+        # Check for __NULL__ values (our explicit null strategy)
+        null_count = df.filter(pl.col(partition_col) == '__NULL__').height
+        null_ratio = null_count / df.height if df.height > 0 else 0
+        
+        # Set different thresholds for different columns
+        null_threshold = 0.2  # Default 20% threshold
+        if partition_col == 'stat_area_name':
+            null_threshold = 0.5  # 50% threshold for geographical data (common to be missing)
+        elif partition_col in ['primary_taxonomy_code']:
+            null_threshold = 0.3  # 30% threshold for taxonomy data
+        
+        if null_ratio > null_threshold:
+            issues.append(f"Column {partition_col} has {null_ratio:.1%} __NULL__ values ({null_count:,}/{df.height:,} rows, threshold: {null_threshold:.1%})")
+        
+        # Check for actual null values (should be handled by __NULL__ strategy)
+        actual_null_count = df.filter(pl.col(partition_col).is_null()).height
+        actual_null_ratio = actual_null_count / df.height if df.height > 0 else 0
+        
+        if actual_null_ratio > 0.05:  # More than 5% actual nulls
+            issues.append(f"Column {partition_col} has {actual_null_ratio:.1%} actual null values ({actual_null_count:,}/{df.height:,} rows)")
+        
+        # Log validation details for each column
+        logger.debug(f"Partition validation for {partition_col}: "
+                    f"Unknown={unknown_ratio:.1%}, __NULL__={null_ratio:.1%}, "
+                    f"Actual nulls={actual_null_ratio:.1%}")
+    
+    # Check for partition key uniqueness and distribution
+    if len(config.PARTITION_COLUMNS) > 1:
+        # Check partition distribution
+        partition_combinations = (
+            df
+            .select(config.PARTITION_COLUMNS)
+            .unique()
+            .height
+        )
+        
+        # Warn if too few unique partition combinations (but don't fail for small datasets)
+        if partition_combinations < 3 and df.height > 10:
+            issues.append(f"Only {partition_combinations} unique partition combinations found (may indicate data quality issues)")
+        elif partition_combinations < 2:
+            issues.append(f"Only {partition_combinations} unique partition combinations found (insufficient for partitioning)")
+        
+        logger.info(f"Found {partition_combinations} unique partition combinations")
+    
+    if issues:
+        error_message = f"Partition validation failed:\n" + "\n".join(f"  - {issue}" for issue in issues)
+        logger.error(error_message)
+        raise ValueError(error_message)
+    
+    logger.info("Partition validation passed successfully")
+    return True
+
+
+def extract_partition_keys(enriched_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Extract partition keys from enriched data.
+    No defaults - only use actual values or handle nulls explicitly.
+    
+    Args:
+        enriched_df: Input DataFrame (enriched with all dimension data)
+        
+    Returns:
+        DataFrame with correct partition columns added
+        
+    Partition mapping:
+    - payer_slug: from fact table
+    - state: from dim_npi_address (state_addr)
+    - billing_class: from fact table
+    - procedure_set: derived from code_description categorization
+    - procedure_class: from dim_code (code_type)
+    - primary_taxonomy_code: from dim_npi
+    - stat_area_name: from dim_npi_address_geo (stat_area_name)
+    - year: extracted from year_month
+    - month: extracted from year_month
+    """
+    
+    logger.info("Extracting partition keys from enriched data...")
+    
+    try:
+        # Define the partition column mapping
+        partition_mapping = {
+            'payer_slug': 'payer_slug',  # from fact
+            'state': 'state_addr',  # from dim_npi_address
+            'billing_class': 'billing_class',  # from fact
+            'procedure_set': 'code_description',  # will be categorized
+            'procedure_class': 'code_type',  # from dim_code
+            'primary_taxonomy_code': 'primary_taxonomy_code',  # from dim_npi
+            'stat_area_name': 'stat_area_name',  # from dim_npi_address_geo
+            'year': 'year_month',  # will be extracted
+            'month': 'year_month'  # will be extracted
+        }
+        
+        # Validate that all source columns exist
+        missing_columns = []
+        for partition_key, source_column in partition_mapping.items():
+            if source_column not in enriched_df.columns:
+                missing_columns.append(f"{partition_key} -> {source_column}")
+        
+        if missing_columns:
+            logger.warning(f"Missing source columns for partition keys: {missing_columns}")
+            logger.warning("Using __NULL__ for missing columns")
+        
+        # Start with the enriched dataframe
+        result_df = enriched_df
+        
+        # Extract year and month from year_month column
+        if 'year_month' in enriched_df.columns:
+            result_df = result_df.with_columns([
+                pl.when(pl.col('year_month').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('year_month').str.slice(0, 4))
+                .alias('year'),
+                pl.when(pl.col('year_month').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('year_month').str.slice(5, 2))
+                .alias('month')
+            ])
+            logger.info("Extracted year and month from year_month")
+        else:
+            result_df = result_df.with_columns([
+                pl.lit('__NULL__').alias('year'),
+                pl.lit('__NULL__').alias('month')
+            ])
+            logger.warning("year_month column not found, using __NULL__")
+        
+        # Handle payer_slug (already in fact table)
+        if 'payer_slug' in enriched_df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('payer_slug').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('payer_slug'))
+                .alias('payer_slug')
+            )
+            logger.info("Added payer_slug partition key")
+        else:
+            result_df = result_df.with_columns(pl.lit('__NULL__').alias('payer_slug'))
+            logger.warning("payer_slug not found, using __NULL__")
+        
+        # Handle state (from dim_npi_address)
+        if 'state_addr' in enriched_df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('state_addr').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('state_addr'))
+                .alias('state')
+            )
+            logger.info("Added state partition key from state_addr")
+        elif 'state' in enriched_df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('state').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('state'))
+                .alias('state')
+            )
+            logger.info("Added state partition key from state")
+        else:
+            result_df = result_df.with_columns(pl.lit('__NULL__').alias('state'))
+            logger.warning("No state column found, using __NULL__")
+        
+        # Handle billing_class (already in fact table)
+        if 'billing_class' in enriched_df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('billing_class').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('billing_class'))
+                .alias('billing_class')
+            )
+            logger.info("Added billing_class partition key")
+        else:
+            result_df = result_df.with_columns(pl.lit('__NULL__').alias('billing_class'))
+            logger.warning("billing_class not found, using __NULL__")
+        
+        # Handle procedure_set (categorize from code_description)
+        if 'code_description' in enriched_df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('code_description').is_null())
+                .then(pl.lit('__NULL__'))
+                .when(pl.col('code_description').str.to_lowercase().str.contains('evaluation|management|office visit|consultation'))
+                .then(pl.lit('Evaluation and Management'))
+                .when(pl.col('code_description').str.to_lowercase().str.contains('surgery|surgical|operation|procedure'))
+                .then(pl.lit('Surgery'))
+                .when(pl.col('code_description').str.to_lowercase().str.contains('imaging|radiology|mri|ct|ultrasound|x-ray'))
+                .then(pl.lit('Radiology'))
+                .when(pl.col('code_description').str.to_lowercase().str.contains('laboratory|lab|blood|urine|test'))
+                .then(pl.lit('Laboratory'))
+                .when(pl.col('code_description').str.to_lowercase().str.contains('therapy|rehabilitation|physical|occupational'))
+                .then(pl.lit('Therapy'))
+                .when(pl.col('code_description').str.to_lowercase().str.contains('emergency|urgent|trauma'))
+                .then(pl.lit('Emergency'))
+                .when(pl.col('code_description').str.to_lowercase().str.contains('anesthesia|anesthetic'))
+                .then(pl.lit('Anesthesia'))
+                .otherwise(pl.lit('Other'))
+                .alias('procedure_set')
+            )
+            logger.info("Added procedure_set partition key from code_description categorization")
+        else:
+            result_df = result_df.with_columns(pl.lit('__NULL__').alias('procedure_set'))
+            logger.warning("code_description not found, using __NULL__")
+        
+        # Handle procedure_class (from dim_code)
+        if 'code_type' in enriched_df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('code_type').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('code_type'))
+                .alias('procedure_class')
+            )
+            logger.info("Added procedure_class partition key from code_type")
+        else:
+            result_df = result_df.with_columns(pl.lit('__NULL__').alias('procedure_class'))
+            logger.warning("code_type not found, using __NULL__")
+        
+        # Handle primary_taxonomy_code (from dim_npi)
+        if 'primary_taxonomy_code' in enriched_df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('primary_taxonomy_code').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('primary_taxonomy_code'))
+                .alias('primary_taxonomy_code')
+            )
+            logger.info("Added primary_taxonomy_code partition key from dim_npi")
+        else:
+            result_df = result_df.with_columns(pl.lit('__NULL__').alias('primary_taxonomy_code'))
+            logger.warning("primary_taxonomy_code not found, using __NULL__")
+        
+        # Handle stat_area_name (from dim_npi_address_geo)
+        if 'stat_area_name' in enriched_df.columns:
+            result_df = result_df.with_columns(
+                pl.when(pl.col('stat_area_name').is_null())
+                .then(pl.lit('__NULL__'))
+                .otherwise(pl.col('stat_area_name'))
+                .alias('stat_area_name')
+            )
+            logger.info("Added stat_area_name partition key from dim_npi_address_geo")
+        else:
+            result_df = result_df.with_columns(pl.lit('__NULL__').alias('stat_area_name'))
+            logger.warning("stat_area_name not found, using __NULL__")
+        
+        logger.info("Partition keys extracted successfully")
+        return result_df
+        
+    except Exception as e:
+        logger.error(f"Error extracting partition keys: {e}")
+        # Return dataframe with __NULL__ partition keys to avoid complete failure
+        logger.warning("Falling back to __NULL__ partition keys")
+        return enriched_df.with_columns([
+            pl.lit("__NULL__").alias('year'),
+            pl.lit("__NULL__").alias('month'),
+            pl.lit('__NULL__').alias('payer_slug'),
+            pl.lit('__NULL__').alias('state'),
+            pl.lit('__NULL__').alias('billing_class'),
+            pl.lit('__NULL__').alias('procedure_set'),
+            pl.lit('__NULL__').alias('procedure_class'),
+            pl.lit('__NULL__').alias('primary_taxonomy_code'),
+            pl.lit('__NULL__').alias('stat_area_name')
+        ])
+
+
 def _add_partitioning_columns(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Add partitioning columns to the DataFrame using real data values.
+    Add partitioning columns to the DataFrame using actual dimension data.
     
     Args:
         df: Input DataFrame (enriched with all dimension data)
         
     Returns:
-        DataFrame with partitioning columns added from actual data
+        DataFrame with partitioning columns added from actual dimension data
+        
+    Partitioning columns mapping:
+    - payer_slug: already in fact table
+    - state: from dim_npi_address (state column)
+    - billing_class: already in fact table
+    - procedure_set/procedure_class: from dim_code
+    - primary_taxonomy_code: from dim_npi
+    - stat_area_name: from dim_npi_address_geo (cbsa_name or similar)
     """
     
-    logger.info("Adding partitioning columns from real data...")
+    logger.info("Adding partitioning columns from actual dimension data...")
     
     try:
-        # Add year and month from year_month column
+        # Add year and month from year_month column (already in fact table)
         if 'year_month' in df.columns:
             df = df.with_columns([
                 pl.col('year_month').str.slice(0, 4).alias('year'),
                 pl.col('year_month').str.slice(5, 2).alias('month')
             ])
         else:
+            logger.warning("year_month column not found, using default values")
             df = df.with_columns([
                 pl.lit("2025").alias('year'),
                 pl.lit("01").alias('month')
             ])
         
-        # Add procedure_set from code_description (real-time categorization)
+        # payer_slug: already in fact table, no changes needed
+        
+        # state: use from dim_npi_address (state column)
+        if 'state_addr' in df.columns:
+            df = df.with_columns(
+                pl.col('state_addr').alias('state')
+            )
+            logger.info("Added state from dim_npi_address")
+        elif 'state' in df.columns:
+            # Keep existing state column if it exists
+            logger.info("Using existing state column from fact table")
+        else:
+            logger.warning("No state column found, adding Unknown")
+            df = df.with_columns(
+                pl.lit('Unknown').alias('state')
+            )
+        
+        # billing_class: already in fact table, no changes needed
+        
+        # procedure_set: create from code_description using actual categorization
         if 'code_description' in df.columns:
             df = df.with_columns(
                 pl.when(pl.col('code_description').is_null())
@@ -494,70 +937,81 @@ def _add_partitioning_columns(df: pl.DataFrame) -> pl.DataFrame:
                 .otherwise(pl.lit('Other'))
                 .alias('procedure_set')
             )
+            logger.info("Added procedure_set from code_description categorization")
         else:
+            logger.warning("code_description not found, adding Unknown for procedure_set")
             df = df.with_columns(
                 pl.lit('Unknown').alias('procedure_set')
             )
         
-        # Add procedure_class from code_type (this is correct - using actual data)
+        # procedure_class: use code_type from dim_code (already joined)
         if 'code_type' in df.columns:
             df = df.with_columns(
-                pl.col('code_type').alias('procedure_class')
+                pl.when(pl.col('code_type').is_null())
+                .then(pl.lit('Unknown'))
+                .otherwise(pl.col('code_type'))
+                .alias('procedure_class')
             )
+            logger.info("Added procedure_class from code_type")
         else:
+            logger.warning("code_type not found, adding Unknown for procedure_class")
             df = df.with_columns(
                 pl.lit('Unknown').alias('procedure_class')
             )
         
-        # Add taxonomy from primary_taxonomy_code (using actual NPI data)
+        # primary_taxonomy_code: use from dim_npi (already joined)
         if 'primary_taxonomy_code' in df.columns:
             df = df.with_columns(
-                pl.col('primary_taxonomy_code').alias('taxonomy')
+                pl.when(pl.col('primary_taxonomy_code').is_null())
+                .then(pl.lit('Unknown'))
+                .otherwise(pl.col('primary_taxonomy_code'))
+                .alias('primary_taxonomy_code')
             )
+            logger.info("Added primary_taxonomy_code from dim_npi")
         else:
+            logger.warning("primary_taxonomy_code not found, adding Unknown")
             df = df.with_columns(
-                pl.lit('Unknown').alias('taxonomy')
+                pl.lit('Unknown').alias('primary_taxonomy_code')
             )
         
-        # Add stat_area_name from geolocation data (using actual address data)
-        if 'stat_area_name' in df.columns:
-            # Use the existing stat_area_name from geolocation
+        # stat_area_name: use from dim_npi_address_geo (already joined)
+        if 'stat_area_name_geo' in df.columns:
             df = df.with_columns(
-                pl.col('stat_area_name').alias('stat_area_name')
-            )
-        elif 'city_addr' in df.columns and 'state_addr' in df.columns:
-            # Fallback to city, state combination
-            df = df.with_columns(
-                pl.when(pl.col('city_addr').is_not_null() & pl.col('state_addr').is_not_null())
-                .then(pl.col('city_addr') + ', ' + pl.col('state_addr'))
-                .otherwise(pl.lit('Unknown'))
+                pl.when(pl.col('stat_area_name_geo').is_null())
+                .then(pl.lit('Unknown'))
+                .otherwise(pl.col('stat_area_name_geo'))
                 .alias('stat_area_name')
             )
-        elif 'city' in df.columns and 'state' in df.columns:
-            # Fallback to basic city, state
+            logger.info("Added stat_area_name from dim_npi_address_geo")
+        elif 'stat_area_name' in df.columns:
+            # Use existing stat_area_name if it exists
             df = df.with_columns(
-                pl.when(pl.col('city').is_not_null() & pl.col('state').is_not_null())
-                .then(pl.col('city') + ', ' + pl.col('state'))
-                .otherwise(pl.lit('Unknown'))
+                pl.when(pl.col('stat_area_name').is_null())
+                .then(pl.lit('Unknown'))
+                .otherwise(pl.col('stat_area_name'))
                 .alias('stat_area_name')
             )
+            logger.info("Using existing stat_area_name column")
         else:
+            logger.warning("stat_area_name not found, adding Unknown")
             df = df.with_columns(
                 pl.lit('Unknown').alias('stat_area_name')
             )
         
-        logger.info("Partitioning columns added successfully from real data")
+        logger.info("Partitioning columns added successfully from actual dimension data")
         return df
         
     except Exception as e:
         logger.error(f"Error adding partitioning columns: {e}")
         # Return minimal partitioning columns to avoid complete failure
+        logger.warning("Falling back to default partitioning columns")
         return df.with_columns([
             pl.lit("2025").alias('year'),
             pl.lit("01").alias('month'),
+            pl.lit('Unknown').alias('state'),
             pl.lit('Unknown').alias('procedure_set'),
             pl.lit('Unknown').alias('procedure_class'),
-            pl.lit('Unknown').alias('taxonomy'),
+            pl.lit('Unknown').alias('primary_taxonomy_code'),
             pl.lit('Unknown').alias('stat_area_name')
         ])
 

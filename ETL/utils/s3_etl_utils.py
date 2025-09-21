@@ -205,6 +205,24 @@ class S3PartitionedETL:
             logger.error(f"Failed to list partitions: {e}")
             return []
     
+    def partition_exists(self, s3_path: str) -> bool:
+        """Check if a partition exists in S3."""
+        
+        bucket, key = self._parse_s3_path(s3_path)
+        
+        try:
+            self.s3_client.head_object(Bucket=bucket, Key=key)
+            logger.debug(f"Partition exists: {s3_path}")
+            return True
+            
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                logger.debug(f"Partition does not exist: {s3_path}")
+                return False
+            else:
+                logger.error(f"Error checking partition existence {s3_path}: {e}")
+                raise
+    
     def download_partition(self, s3_path: str) -> pl.DataFrame:
         """Download and load a partition from S3."""
         
@@ -224,6 +242,10 @@ class S3PartitionedETL:
         except ClientError as e:
             logger.error(f"Failed to download partition {s3_path}: {e}")
             raise
+    
+    def read_partition(self, s3_path: str) -> pl.DataFrame:
+        """Alias for download_partition for consistency."""
+        return self.download_partition(s3_path)
     
     def create_athena_table(self, database_name: str, table_name: str, output_location: str) -> str:
         """Create Athena table for querying S3 partitioned data."""
