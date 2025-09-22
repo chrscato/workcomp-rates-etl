@@ -1,0 +1,31 @@
+# ETL1 Scalable Pipeline Configuration
+
+# Data paths
+data_root: "data"
+input_dir: "data/input"
+dims_dir: "data/dims"
+xrefs_dir: "data/xrefs"
+gold_dir: "data/gold"
+
+# Processing parameters
+state: "GA"
+payer_slug_override: null  # Override payer slug generation
+chunk_size: 50000  # Rows per chunk
+memory_limit_mb: 8192  # Memory limit in MB
+
+# File patterns (use {payer} placeholder)
+rates_file_pattern: "202508_{payer}_ga_rates.parquet"
+providers_file_pattern: "202508_{payer}_ga_providers.parquet"
+
+# Output files
+dim_code_file: "dim_code.parquet"
+dim_payer_file: "dim_payer.parquet"
+dim_provider_group_file: "dim_provider_group.parquet"
+dim_pos_set_file: "dim_pos_set.parquet"
+xref_pg_npi_file: "xref_pg_member_npi.parquet"
+xref_pg_tin_file: "xref_pg_member_tin.parquet"
+fact_rate_file: "fact_rate.parquet"
+
+# Logging
+log_level: "INFO"
+log_file: "logs/etl1_scalable.log"

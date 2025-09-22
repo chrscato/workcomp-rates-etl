@@ -404,6 +404,13 @@ def main():
                     format_func=lambda x: str(x) if x else "All Years",
                     help="Optional: Filter by year"
                 )
+                
+                month = st.selectbox(
+                    "Month:",
+                    [None] + [row[0] for row in filter_options['months']],
+                    format_func=lambda x: str(x) if x else "All Months",
+                    help="Optional: Filter by month"
+                )
             
             # Analysis options
             st.subheader("📊 Analysis Options")
