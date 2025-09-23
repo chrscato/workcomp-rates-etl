@@ -360,28 +360,52 @@ def _enrich_fact_table(fact_rate: pl.DataFrame, dimensions: Dict[str, pl.DataFra
         )
         logger.info("Joined with POS set dimension")
     
-    # Add NPI data through cross-reference
+    # Add NPI data through cross-reference (chunk-scoped filter to avoid global fan-out)
     if 'pg_member_npi' in xrefs and 'npi' in dimensions:
-        # Join fact -> xref -> npi
-        enriched = enriched.join(
-            xrefs['pg_member_npi'],
-            on='pg_uid',
-            how='left'
-        ).join(
-            dimensions['npi'],
-            on='npi',
-            how='left'
-        )
-        logger.info("Joined with NPI data through cross-reference")
+        try:
+            # Only keep xref rows for pg_uid values present in this chunk
+            chunk_pg_uids = (
+                enriched
+                .select(pl.col('pg_uid').unique())
+                .to_series()
+            )
+            xref_npi_filtered = (
+                xrefs['pg_member_npi']
+                .select(['pg_uid', 'npi'])
+                .filter(pl.col('pg_uid').is_in(chunk_pg_uids))
+            )
+            npi_dim_narrow = dimensions['npi'].select([
+                'npi', 'primary_taxonomy_code'
+            ]) if 'primary_taxonomy_code' in dimensions['npi'].columns else dimensions['npi'].select(['npi'])
+
+            # Join fact -> filtered xref -> narrow npi dim
+            enriched = (
+                enriched
+                .join(xref_npi_filtered, on='pg_uid', how='left')
+                .join(npi_dim_narrow, on='npi', how='left')
+            )
+            logger.info("Joined with NPI data through cross-reference (filtered by chunk pg_uid)")
+        except Exception as e:
+            logger.error(f"NPI cross-reference join failed: {e}")
     
     # Add TIN data through cross-reference
     if 'pg_member_tin' in xrefs:
-        enriched = enriched.join(
-            xrefs['pg_member_tin'],
-            on='pg_uid',
-            how='left'
-        )
-        logger.info("Joined with TIN data through cross-reference")
+        try:
+            # Only keep xref rows for pg_uid values present in this chunk; narrow columns
+            chunk_pg_uids = (
+                enriched
+                .select(pl.col('pg_uid').unique())
+                .to_series()
+            )
+            xref_tin_filtered = (
+                xrefs['pg_member_tin']
+                .select([col for col in ['pg_uid', 'tin_value'] if col in xrefs['pg_member_tin'].columns])
+                .filter(pl.col('pg_uid').is_in(chunk_pg_uids))
+            )
+            enriched = enriched.join(xref_tin_filtered, on='pg_uid', how='left')
+            logger.info("Joined with TIN data through cross-reference (filtered by chunk pg_uid)")
+        except Exception as e:
+            logger.error(f"TIN cross-reference join failed: {e}")
     
     # Add geolocation data through NPI address (LOCATION addresses only)
     if 'npi_address_geo' in dimensions and 'npi' in enriched.columns:

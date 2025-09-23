@@ -49,8 +49,8 @@ class ETL1Config:
     # Processing parameters
     state: str = "GA"
     payer_slug_override: Optional[str] = None
-    chunk_size: int = 5000  # Further reduced for better memory management
-    memory_limit_mb: int = 2048  # Further reduced default memory limit
+    chunk_size: int = 1000  # Very conservative chunk size for memory-constrained systems
+    memory_limit_mb: int = 1024  # Very conservative memory limit
     
     # File patterns
     rates_file_pattern: str = "202508_{payer}_ga_rates.parquet"
@@ -208,15 +208,19 @@ class ScalableETL1:
         """Check if we're approaching memory limits"""
         memory = self.get_memory_usage()
         
-        # Warn if process memory exceeds 80% of configured limit
+        # Warn if process memory exceeds 70% of configured limit (more aggressive)
         process_limit_mb = self.config.memory_limit_mb
-        if memory["process_mb"] > process_limit_mb * 0.8:
+        if memory["process_mb"] > process_limit_mb * 0.7:
             self.logger.warning(f"High memory usage: {memory['process_mb']:.1f}MB / {process_limit_mb}MB")
+            # Force garbage collection
+            gc.collect()
             return False
         
         # Warn if system memory is low
-        if memory["system_available_gb"] < 1.0:  # Less than 1GB available
+        if memory["system_available_gb"] < 0.5:  # Less than 500MB available (more aggressive)
             self.logger.warning(f"Low system memory: {memory['system_available_gb']:.1f}GB available")
+            # Force garbage collection
+            gc.collect()
             return False
         
         return True
@@ -485,7 +489,7 @@ class ScalableETL1:
         return temp_path
     
     def merge_temp_files(self, output_path: Path, table_name: str, keys: List[str]) -> None:
-        """Merge all temporary files into final output file"""
+        """Merge all temporary files into final output file using batched approach"""
         temp_dir = output_path.parent / "temp_chunks"
         temp_pattern = f"{table_name}_chunk_*.parquet"
         
@@ -508,41 +512,101 @@ class ScalableETL1:
                 os.rename(temp_files[0], output_path)
                 self.logger.info(f"Renamed single temp file to {output_path}")
             else:
-                # Multiple files - merge them
-                temp_paths_str = "', '".join(str(f) for f in temp_files)
+                # Multiple files - merge them in batches to avoid memory issues
+                max_files_per_batch = 10  # Process max 10 files at a time
                 
-                if table_name == "fact_rate":
-                    # For fact table, just concatenate all files
-                    self.db_conn.execute(f"""
-                        COPY (
-                            SELECT * FROM read_parquet(['{temp_paths_str}'])
-                        ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
-                    """)
-                else:
-                    # For dimensions, deduplicate based on keys using a window function
-                    # Keep the first row per key group ordered by rowid
-                    partition_cols = ", ".join(keys) if keys else ""
-                    self.db_conn.execute(f"""
-                        COPY (
-                            WITH all_rows AS (
+                if len(temp_files) <= max_files_per_batch:
+                    # Small number of files - merge all at once
+                    temp_paths_str = "', '".join(str(f) for f in temp_files)
+                    
+                    if table_name == "fact_rate":
+                        # For fact table, just concatenate all files
+                        self.db_conn.execute(f"""
+                            COPY (
                                 SELECT * FROM read_parquet(['{temp_paths_str}'])
-                            )
-                            SELECT * FROM (
-                                SELECT 
-                                    all_rows.*, 
-                                    ROW_NUMBER() OVER (PARTITION BY {partition_cols} ORDER BY rowid) AS rn
-                                FROM all_rows
-                            )
-                            WHERE rn = 1
-                        ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
-                    """)
+                            ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                        """)
+                    else:
+                        # For dimensions, deduplicate using simple DISTINCT
+                        self.db_conn.execute(f"""
+                            COPY (
+                                SELECT DISTINCT * FROM read_parquet(['{temp_paths_str}'])
+                            ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                        """)
+                else:
+                    # Large number of files - merge in batches
+                    self.logger.info(f"Large number of files ({len(temp_files)}), merging in batches of {max_files_per_batch}")
+                    
+                    # Create intermediate merge files
+                    intermediate_files = []
+                    batch_num = 0
+                    
+                    for i in range(0, len(temp_files), max_files_per_batch):
+                        batch_files = temp_files[i:i + max_files_per_batch]
+                        batch_paths_str = "', '".join(str(f) for f in batch_files)
+                        
+                        # Create intermediate file for this batch
+                        intermediate_file = temp_dir / f"{table_name}_batch_{batch_num:03d}.parquet"
+                        intermediate_files.append(intermediate_file)
+                        
+                        if table_name == "fact_rate":
+                            # For fact table, just concatenate
+                            self.db_conn.execute(f"""
+                                COPY (
+                                    SELECT * FROM read_parquet(['{batch_paths_str}'])
+                                ) TO '{intermediate_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                            """)
+                        else:
+                            # For dimensions, deduplicate
+                            self.db_conn.execute(f"""
+                                COPY (
+                                    SELECT DISTINCT * FROM read_parquet(['{batch_paths_str}'])
+                                ) TO '{intermediate_file}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                            """)
+                        
+                        batch_num += 1
+                        self.logger.info(f"Created intermediate batch file {batch_num}: {intermediate_file.name}")
+                        
+                        # Clean up original temp files in this batch
+                        for temp_file in batch_files:
+                            try:
+                                os.remove(temp_file)
+                            except (OSError, PermissionError):
+                                self.logger.warning(f"Could not remove temp file {temp_file}")
+                    
+                    # Now merge all intermediate files into final output
+                    if len(intermediate_files) == 1:
+                        os.rename(intermediate_files[0], output_path)
+                    else:
+                        intermediate_paths_str = "', '".join(str(f) for f in intermediate_files)
+                        
+                        if table_name == "fact_rate":
+                            self.db_conn.execute(f"""
+                                COPY (
+                                    SELECT * FROM read_parquet(['{intermediate_paths_str}'])
+                                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                            """)
+                        else:
+                            self.db_conn.execute(f"""
+                                COPY (
+                                    SELECT DISTINCT * FROM read_parquet(['{intermediate_paths_str}'])
+                                ) TO '{output_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                            """)
+                        
+                        # Clean up intermediate files
+                        for intermediate_file in intermediate_files:
+                            try:
+                                os.remove(intermediate_file)
+                            except (OSError, PermissionError):
+                                self.logger.warning(f"Could not remove intermediate file {intermediate_file}")
                 
                 self.logger.info(f"Merged {len(temp_files)} temp files into {output_path}")
             
-            # Clean up temp files
+            # Clean up any remaining temp files
             for temp_file in temp_files:
                 try:
-                    os.remove(temp_file)
+                    if temp_file.exists():
+                        os.remove(temp_file)
                 except (OSError, PermissionError):
                     self.logger.warning(f"Could not remove temp file {temp_file}")
             
@@ -773,12 +837,15 @@ class ScalableETL1:
             del rates_chunk, dims, fact_chunk
             self.cleanup_memory()
             
-            # Check memory limits every 10 chunks
-            if chunk_idx % 10 == 0:
+            # Check memory limits every 5 chunks (more frequent)
+            if chunk_idx % 5 == 0:
                 if not self.check_memory_limits():
                     self.logger.warning(f"Memory pressure detected at chunk {chunk_idx + 1}")
                     # Force more aggressive cleanup
                     gc.collect()
+                    # If memory is still high, reduce chunk size for next iteration
+                    if self.get_memory_usage()["process_mb"] > self.config.memory_limit_mb * 0.8:
+                        self.logger.warning("Memory still high after cleanup - consider reducing chunk size")
         
         # Process providers data
         self.logger.info("Processing providers data...")
@@ -811,11 +878,14 @@ class ScalableETL1:
             del providers_chunk, prov_dims
             self.cleanup_memory()
             
-            # Check memory limits every 10 chunks
-            if chunk_idx % 10 == 0:
+            # Check memory limits every 5 chunks (more frequent)
+            if chunk_idx % 5 == 0:
                 if not self.check_memory_limits():
                     self.logger.warning(f"Memory pressure detected at provider chunk {chunk_idx + 1}")
                     gc.collect()
+                    # If memory is still high, reduce chunk size for next iteration
+                    if self.get_memory_usage()["process_mb"] > self.config.memory_limit_mb * 0.8:
+                        self.logger.warning("Memory still high after cleanup - consider reducing chunk size")
         
         # Final merge step - combine all temp files into final outputs
         self.logger.info("Merging all temporary files into final outputs...")
@@ -860,8 +930,8 @@ def main():
     parser = argparse.ArgumentParser(description="Scalable ETL1 Pipeline")
     parser.add_argument("--state", default="GA", help="State code (default: GA)")
     parser.add_argument("--payer-slug", help="Payer slug override")
-    parser.add_argument("--chunk-size", type=int, default=5000, help="Chunk size for processing (default: 5000)")
-    parser.add_argument("--memory-limit", type=int, default=2048, help="Memory limit in MB (default: 2048)")
+    parser.add_argument("--chunk-size", type=int, default=1000, help="Chunk size for processing (default: 1000)")
+    parser.add_argument("--memory-limit", type=int, default=1024, help="Memory limit in MB (default: 1024)")
     parser.add_argument("--config", help="Path to YAML config file")
     parser.add_argument("--payer", required=True, help="Payer name (e.g., aetna, uhc)")
     parser.add_argument("--force-cleanup", action="store_true", help="Force cleanup of existing output files before processing")

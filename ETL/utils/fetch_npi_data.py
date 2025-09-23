@@ -37,7 +37,7 @@ class NPPESFetcher:
         self.data_dir = base_path / "data"
         self.dims_path = self.data_dir / "dims"
         self.xrefs_path = self.data_dir / "xrefs"
-        self.dim_path = self.dims_path / "dim_npi.parquet"
+        self.dim_path = self.dims_path / "dim_npi_temp.parquet"
         self.addr_path = self.dims_path / "dim_npi_address.parquet"
         self.xref_path = self.xrefs_path / "xref_pg_member_npi.parquet"
         self.threads = threads
@@ -56,13 +56,21 @@ class NPPESFetcher:
         
         print(f"📊 Found {len(all_npis)} unique NPIs in xref file")
         
-        # Check if dim_npi file exists
-        if not self.dim_path.exists():
+        # Check if dim_npi file exists (try both original and temp versions)
+        original_dim_path = self.dims_path / "dim_npi.parquet"
+        if not self.dim_path.exists() and not original_dim_path.exists():
             print("📝 No existing dim_npi file found - will fetch all NPIs")
             return list(all_npis)
         
-        # Read existing dim_npi data
-        existing_df = pl.read_parquet(str(self.dim_path))
+        # Read existing dim_npi data (try temp first, then original)
+        if self.dim_path.exists():
+            existing_df = pl.read_parquet(str(self.dim_path))
+        elif original_dim_path.exists():
+            existing_df = pl.read_parquet(str(original_dim_path))
+            print("📝 Using original dim_npi.parquet as starting point")
+        else:
+            print("📝 No existing dim_npi file found - will fetch all NPIs")
+            return list(all_npis)
         
         # Get NPIs that have already been fetched
         if "nppes_fetched" in existing_df.columns:
@@ -108,7 +116,7 @@ class NPPESFetcher:
                 print(f"❌ Error fetching NPI {npi}: {e}")
     
     def update_dim_npi(self, results_batch):
-        """Update dim_npi file with a batch of results."""
+        """Update dim_npi file with a batch of results - MEMORY EFFICIENT VERSION."""
         if not results_batch:
             return
             
@@ -116,93 +124,115 @@ class NPPESFetcher:
             # Ensure dims directory exists
             self.dims_path.mkdir(parents=True, exist_ok=True)
             
-            # Read existing data if it exists
-            if self.dim_path.exists():
-                existing_df = pl.read_parquet(str(self.dim_path))
-            else:
-                # Create empty dataframe with the structure from the first result
-                first_dim_df = results_batch[0][0]
-                existing_df = first_dim_df.filter(pl.lit(False))  # Empty with same schema
+            # Collect all new data first
+            new_dim_dataframes = []
+            new_addr_dataframes = []
+            npis_to_remove = set()
             
-            # Process each result
             for dim_df, addr_df, npi in results_batch:
-                # Remove existing NPI if it exists
-                existing_df = existing_df.filter(pl.col("npi") != str(npi))
-                
-                # Get all unique columns
-                all_columns = list(set(existing_df.columns + dim_df.columns))
-                
-                # Add missing columns to existing_df
-                for col in all_columns:
-                    if col not in existing_df.columns:
-                        existing_df = existing_df.with_columns(pl.lit(None).alias(col))
-                
-                # Add missing columns to new data
-                for col in all_columns:
-                    if col not in dim_df.columns:
-                        dim_df = dim_df.with_columns(pl.lit(None).alias(col))
-                
-                # Reorder columns
-                existing_df = existing_df.select(all_columns)
-                dim_df = dim_df.select(all_columns)
-                
-                # Concatenate
-                existing_df = pl.concat([existing_df, dim_df], how="vertical_relaxed")
-            
-            # Write updated data
-            existing_df.write_parquet(str(self.dim_path))
-            
-            # Update addresses
-            for _, addr_df, _ in results_batch:
+                new_dim_dataframes.append(dim_df)
                 if addr_df.height > 0:
-                    upsert_dim_npi_address(addr_df, self.addr_path)
+                    new_addr_dataframes.append(addr_df)
+                npis_to_remove.add(str(npi))
+            
+            # Process dim_npi updates
+            if new_dim_dataframes:
+                new_combined_dim_df = pl.concat(new_dim_dataframes, how="vertical_relaxed")
+                
+                # Read existing dim_npi data only once
+                if self.dim_path.exists():
+                    existing_dim_df = pl.read_parquet(str(self.dim_path))
+                    
+                    # Remove all NPIs that we're updating
+                    if npis_to_remove:
+                        existing_dim_df = existing_dim_df.filter(~pl.col("npi").is_in(list(npis_to_remove)))
+                    
+                    # Align schemas and concatenate
+                    all_columns = list(set(existing_dim_df.columns + new_combined_dim_df.columns))
+                    
+                    for col in all_columns:
+                        if col not in existing_dim_df.columns:
+                            existing_dim_df = existing_dim_df.with_columns(pl.lit(None).alias(col))
+                        if col not in new_combined_dim_df.columns:
+                            new_combined_dim_df = new_combined_dim_df.with_columns(pl.lit(None).alias(col))
+                    
+                    existing_dim_df = existing_dim_df.select(all_columns)
+                    new_combined_dim_df = new_combined_dim_df.select(all_columns)
+                    
+                    final_dim_df = pl.concat([existing_dim_df, new_combined_dim_df], how="vertical_relaxed")
+                else:
+                    final_dim_df = new_combined_dim_df
+                
+                # Write dim_npi data once
+                final_dim_df.write_parquet(str(self.dim_path))
+            
+            # Process address updates - OPTIMIZED APPROACH
+            if new_addr_dataframes:
+                new_combined_addr_df = pl.concat(new_addr_dataframes, how="vertical_relaxed")
+                
+                # Fast append approach (no deduplication during processing for speed)
+                if self.addr_path.exists():
+                    try:
+                        existing_addr_df = pl.read_parquet(str(self.addr_path))
+                        combined_addr_df = pl.concat([existing_addr_df, new_combined_addr_df], how="vertical_relaxed")
+                        combined_addr_df.write_parquet(str(self.addr_path), compression="zstd")
+                    except Exception as e:
+                        # If there's any issue, just write new data
+                        print(f"⚠️  Address file issue, writing new data: {e}")
+                        new_combined_addr_df.write_parquet(str(self.addr_path), compression="zstd")
+                else:
+                    new_combined_addr_df.write_parquet(str(self.addr_path), compression="zstd")
+                
+                print(f"📝 Updated address file with {len(new_addr_dataframes)} records")
                     
         except Exception as e:
             print(f"❌ Error updating dim_npi: {e}")
     
-    def fetch_npis_parallel(self, npis: list, batch_size: int = 50):
-        """Fetch NPIs in parallel with batching."""
+    def fetch_npis_parallel(self, npis: list, batch_size: int = 1000):
+        """Fetch NPIs in parallel with optimized chunking."""
         total_npis = len(npis)
         print(f"🚀 Starting parallel fetch for {total_npis} NPIs")
         print(f"🧵 Using {self.threads} threads")
         print(f"⏱️  Sleep between requests: {self.sleep}s")
-        print(f"📦 Batch size: {batch_size}")
+        print(f"📦 Chunk size: {batch_size} (optimized for fewer file I/O operations)")
         print()
         
-        # Process in batches to avoid memory issues
+        # Process in larger chunks to minimize file I/O
         for i in range(0, total_npis, batch_size):
-            batch_npis = npis[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (total_npis + batch_size - 1) // batch_size
+            chunk_npis = npis[i:i + batch_size]
+            chunk_num = i // batch_size + 1
+            total_chunks = (total_npis + batch_size - 1) // batch_size
             
-            print(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch_npis)} NPIs)")
+            print(f"📦 Processing chunk {chunk_num}/{total_chunks} ({len(chunk_npis)} NPIs)")
             
-            # Clear results for this batch
+            # Clear results for this chunk
             self.results = []
             
-            # Process batch in parallel
+            # Process chunk in parallel
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
-                futures = [executor.submit(self.fetch_single_npi, npi) for npi in batch_npis]
+                futures = [executor.submit(self.fetch_single_npi, npi) for npi in chunk_npis]
                 
                 # Wait for completion
                 for future in as_completed(futures):
                     self.processed += 1
-                    if self.processed % 100 == 0:
+                    if self.processed % 200 == 0:
                         progress = (self.processed / total_npis) * 100
                         print(f"📊 Progress: {self.processed}/{total_npis} ({progress:.1f}%) - Found: {self.found}, Errors: {self.errors}")
             
-            # Update dim_npi file with this batch
+            # Update files with this chunk (single file I/O per chunk)
             if self.results:
-                print(f"💾 Updating dim_npi with {len(self.results)} results...")
+                print(f"💾 Updating files with {len(self.results)} results...")
                 self.update_dim_npi(self.results)
             
-            print(f"✅ Batch {batch_num} complete")
+            print(f"✅ Chunk {chunk_num} complete")
             print()
         
         print("🎉 Parallel fetch complete!")
         print(f"   📈 Total processed: {self.processed}")
         print(f"   ✅ Found: {self.found}")
         print(f"   ❌ Errors: {self.errors}")
+        
+        # Address files are already merged during processing
 
 def main():
     parser = argparse.ArgumentParser(description="Fast parallel NPPES data fetcher")

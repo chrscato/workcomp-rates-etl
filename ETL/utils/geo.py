@@ -160,6 +160,15 @@ def parse_geographies(j: dict) -> Dict[str, Any]:
 # Cell 4: load parquet and determine which rows need enrichment
 df_input = pl.read_parquet(DIM_NPI_ADDRESS_PARQUET)
 
+# Drop all MAILING address purpose rows
+if "address_purpose" in df_input.columns:
+    original_count = df_input.height
+    df_input = df_input.filter(pl.col("address_purpose") != "MAILING")
+    filtered_count = df_input.height
+    print(f"Filtered out {original_count - filtered_count:,} MAILING address rows. Remaining: {filtered_count:,}")
+else:
+    print("Warning: 'address_purpose' column not found. No filtering applied.")
+
 # ensure expected columns exist
 required_cols = ["npi","address_1","city","state","postal_code","address_hash"]
 missing = [c for c in required_cols if c not in df_input.columns]

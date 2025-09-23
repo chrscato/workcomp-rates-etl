@@ -1,5 +1,5 @@
-# ETL3 Configuration File
-# S3 Partitioned Data Warehouse Pipeline
+# ETL3 Memory-Optimized Configuration File
+# For memory-constrained systems (4-8GB RAM)
 
 # S3 Configuration
 s3:
@@ -9,11 +9,11 @@ s3:
   compression: "zstd"
   encryption: "AES256"
 
-# Processing Configuration
+# Processing Configuration - MEMORY OPTIMIZED
 processing:
-  chunk_size: 50000
-  max_workers: 4
-  memory_limit_mb: 8192
+  chunk_size: 1000          # VERY small chunks for memory-constrained systems
+  max_workers: 1            # Single worker to avoid memory multiplication
+  memory_limit_mb: 1024     # Conservative 1GB limit
   enable_streaming: true
 
 # Data Paths
@@ -31,7 +31,6 @@ data_paths:
     npi: "data/dims/dim_npi.parquet"
     npi_address: "data/dims/dim_npi_address.parquet"
     npi_address_geo: "data/dims/dim_npi_address_geolocation.parquet"
-    medicare_benchmark: "data/dims/bench_medicare_comprehensive.parquet"
   
   cross_references:
     pg_member_npi: "data/xrefs/xref_pg_member_npi.parquet"
@@ -50,10 +49,10 @@ partitioning:
     - "year"
     - "month"
   
-  # Partition size limits
-  max_partition_size_mb: 100
+  # Partition size limits - MEMORY OPTIMIZED
+  max_partition_size_mb: 50      # Smaller partitions
   min_partition_rows: 1
-  max_partition_rows: 10000
+  max_partition_rows: 5000       # Smaller max partition size
 
 # Athena Configuration
 athena:
@@ -79,23 +78,11 @@ athena:
       type: "integer"
       range: "1,12"
 
-# Glue Configuration
-glue:
-  crawler_name: "fact_rate_enriched_crawler"
-  database_name: "healthcare_data_lake"
-  role_arn: "arn:aws:iam::123456789012:role/GlueServiceRole"
-  
-  # Crawler settings
-  recrawl_behavior: "CRAWL_EVERYTHING"
-  schema_change_policy:
-    update_behavior: "UPDATE_IN_DATABASE"
-    delete_behavior: "LOG"
-
 # Data Quality Configuration
 data_quality:
   enable_validation: true
-  sample_partitions: 10
-  max_errors_per_partition: 100
+  sample_partitions: 5           # Reduced for memory efficiency
+  max_errors_per_partition: 50   # Reduced for memory efficiency
   
   # Quality rules
   rules:
@@ -121,9 +108,9 @@ data_quality:
 
 # Monitoring Configuration
 monitoring:
-  enable_cloudwatch: true
-  enable_dashboard: true
-  enable_alarms: true
+  enable_cloudwatch: false       # Disabled for memory efficiency
+  enable_dashboard: false        # Disabled for memory efficiency
+  enable_alarms: false           # Disabled for memory efficiency
   
   # CloudWatch settings
   namespace: "HealthcareDataLake/ETL3"
@@ -149,8 +136,8 @@ logging:
   
   # Log files
   log_dir: "logs"
-  max_file_size_mb: 100
-  backup_count: 5
+  max_file_size_mb: 50           # Smaller log files
+  backup_count: 3                # Fewer backups
 
 # Security Configuration
 security:
@@ -171,11 +158,11 @@ security:
     - "cloudwatch:PutMetricData"
     - "cloudwatch:PutDashboard"
 
-# Performance Tuning
+# Performance Tuning - MEMORY OPTIMIZED
 performance:
   # S3 settings
   s3:
-    max_pool_connections: 50
+    max_pool_connections: 10     # Reduced for memory efficiency
     retry_attempts: 3
     timeout_seconds: 30
   
@@ -185,11 +172,11 @@ performance:
     lazy_evaluation: true
     memory_efficient: true
   
-  # Parallel processing
+  # Parallel processing - DISABLED for memory efficiency
   parallel:
-    max_workers: 4
-    chunk_size: 50000
-    enable_multiprocessing: true
+    max_workers: 1               # Single worker
+    chunk_size: 1000             # Small chunks
+    enable_multiprocessing: false # Disabled
 
 # Environment-specific overrides
 environments:
@@ -197,7 +184,8 @@ environments:
     s3:
       bucket: "healthcare-data-lake-dev"
     processing:
-      chunk_size: 10000
+      chunk_size: 500            # Even smaller for development
+      memory_limit_mb: 512       # Very conservative
     monitoring:
       enable_alarms: false
   
@@ -205,15 +193,17 @@ environments:
     s3:
       bucket: "healthcare-data-lake-staging"
     processing:
-      chunk_size: 25000
+      chunk_size: 1000           # Small chunks
+      memory_limit_mb: 1024      # Conservative
     monitoring:
-      enable_alarms: true
+      enable_alarms: false       # Disabled for memory efficiency
   
   production:
     s3:
       bucket: "healthcare-data-lake-prod"
     processing:
-      chunk_size: 50000
+      chunk_size: 1000           # Small chunks for memory-constrained systems
+      memory_limit_mb: 1024      # Conservative limit
     monitoring:
-      enable_alarms: true
-      enable_dashboard: true
+      enable_alarms: false       # Disabled for memory efficiency
+      enable_dashboard: false
